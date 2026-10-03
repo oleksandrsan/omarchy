@@ -108,11 +108,15 @@ Kimchi reads `KIMCHI_API_KEY` first, then the key in
 `~/.config/kimchi/config.json`, and asks the gateway its region names (or
 `KIMCHI_BASE_URL`); its sessions follow `KIMCHI_CODING_AGENT_DIR`. The
 credits answer says how much remains but not how much was bought, so the
-balance meter only fills in when a personal spend budget supplies the funded
-figure. Every budget is a limit line that resets when its period ends,
-titled Monthly or Weekly when the period is one, with each capped provider
-inside it a tick on that line. When the gateway can't be reached, the last
-answer stays up, dimmed and dated.
+balance shows the remaining figure without a funded meter; a spend budget's
+cap is what may be spent, not what was bought, so it never stands in. Every
+budget is a limit line that resets when its period ends, titled Monthly or
+Weekly when the period is one, with each capped provider inside it a tick on
+that line (or a line of its own in a period of another length). Each
+endpoint falls back on its own: when one can't be reached, its last answer
+stays up, dimmed and dated, beside the other's fresh one. A rejected key
+reads as such rather than offering the panel's sign-in, since Kimchi signs
+in through its own CLI.
 
 ### Fireworks balance
 

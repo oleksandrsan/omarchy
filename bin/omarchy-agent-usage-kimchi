@@ -229,19 +229,20 @@ def plan_label(raw):
 
 
 # The credits answer names the plan and what's left of the prepaid balance.
-# It says how much remains but not how much was bought, so the gauge has
-# no funded figure unless a budget supplies one.
-def apply_credits(result, data):
+# It says how much remains but not how much was bought, so the gauge shows
+# the remaining figure alone.
+def credits_part(data):
   if data.get("serverless") is False:
-    return
+    return {}
   tier = next((data[k] for k in ("tier", "tier_name", "tierName") if k in data), "")
-  result["tierLabel"] = plan_label(tier)
+  part = {"tierLabel": plan_label(tier)}
   remaining = usd(data.get("remaining"))
   if remaining is not None and remaining >= 0:
-    result["balance"] = {"remaining": remaining, "funded": 0, "spent": 0, "currency": "USD", "estimated": False}
+    part["balance"] = {"remaining": remaining, "funded": 0, "spent": 0, "currency": "USD", "estimated": False}
   has_credits = next((data[k] for k in ("has_credits", "hasCredits") if k in data), None)
   if has_credits is False or (remaining is not None and remaining <= 0):
-    result["usageStatusText"] = "Out of credits, rate limited"
+    part["usageStatusText"] = "Out of credits, rate limited"
+  return part
 
 
 def parse_time(value):
@@ -268,12 +269,14 @@ def period_title(period):
 
 # Each spend budget is a limit window: spend against its cap until the
 # period ends. A provider capped inside it is its own allowance on the same
-# clock, which the panel draws as a tick on that budget's meter. A personal
-# budget also gives the balance its funded figure.
-def apply_budget(result, data):
+# clock, which the panel draws as a tick on that budget's meter; in a period
+# the panel has no clock name for, it gets a line of its own. A cap is what
+# may be spent, not what was bought, so it never funds the balance gauge.
+def budget_part(data):
   period = data.get("period") if isinstance(data.get("period"), dict) else {}
   resets = str(period.get("endTime") or "")
   title = period_title(period)
+  limits = []
   for entry in data.get("budgets") or []:
     if not isinstance(entry, dict):
       continue
@@ -286,8 +289,8 @@ def apply_budget(result, data):
       limit["title"] = title
     if resets:
       limit["resetsAt"] = resets
-    result["limits"].append(limit)
-    for provider in (entry.get("providerBudgets") or []) if title else []:
+    limits.append(limit)
+    for provider in entry.get("providerBudgets") or []:
       if not isinstance(provider, dict) or not str(provider.get("limitType") or "").endswith("CAPPED"):
         continue
       provider_cap = usd(provider.get("budgetLimitUsd"))
@@ -295,60 +298,75 @@ def apply_budget(result, data):
       name = str(provider.get("provider") or "").strip()
       if not (provider_cap and used is not None and name):
         continue
-      scoped = {"label": f"{name} budget", "title": f"{name[:1].upper()}{name[1:]} {title}", "percent": max(0.0, min(1.0, used / provider_cap))}
+      name = name[:1].upper() + name[1:]
+      scoped = {"label": f"{name} budget", "title": f"{name} {title}" if title else f"{name} budget", "percent": max(0.0, min(1.0, used / provider_cap))}
       if resets:
         scoped["resetsAt"] = resets
-      result["limits"].append(scoped)
-    balance = result.get("balance")
-    if balance and not balance["funded"] and entry.get("scope") in ("USER", "API_KEY"):
-      balance.update(funded=cap, spent=spent)
+      limits.append(scoped)
+  return {"limits": limits}
 
 
-# Keyed by the API key, so a machine signed in to someone else never shows
-# the last one's numbers.
-def billing_cache(key):
-  return cache_root() / f"kimchi-billing-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json"
+# Keyed by the API key and the gateway it was asked of, so a machine signed
+# in to someone else, or pointed at another region, never shows the last
+# one's numbers.
+def billing_cache(key, base):
+  digest = hashlib.sha256((base + "\n" + key).encode()).hexdigest()[:16]
+  return cache_root() / f"kimchi-billing-{digest}.json"
 
 
+# The two endpoints answer on their own, and so does each fall back: a part
+# that didn't come back is the last one that did, dimmed and dated, so one
+# endpoint failing never blanks or overwrites what the other said.
 def collect_billing():
   result = {"tierLabel": "", "limits": [], "usageStatusText": "", "authHelpText": AUTH_HELP, "signedIn": False, "limitsStale": False, "limitsFetchedAt": 0}
   key, base = gateway()
   if not key:
     return result
   result["signedIn"] = True
-  reached = False
-  for resource, apply in (("credits", apply_credits), ("budget", apply_budget)):
+
+  cache = billing_cache(key, base)
+  cached = read_json(cache) or {}
+  parts = {}
+  rejected = unreachable = False
+  now = round(time.time() * 1000)
+  for resource, parse in (("credits", credits_part), ("budget", budget_part)):
     try:
       data = get_json(f"{base}/v1/{resource}", key)
+      parts[resource] = dict(parse(data if isinstance(data, dict) else {}), fetchedAtMs=now, fresh=True)
     except urllib.error.HTTPError as error:
-      if error.code in (401, 403):
-        result["usageStatusText"] = "Waiting for auth"
-      continue
+      rejected = rejected or error.code in (401, 403)
     except Exception:
-      continue
-    reached = True
-    if isinstance(data, dict):
-      apply(result, data)
+      unreachable = True
+    if resource not in parts and isinstance(cached.get(resource), dict) and cached[resource].get("fetchedAtMs"):
+      parts[resource] = dict(cached[resource], fresh=False)
 
-  cache = billing_cache(key)
-  if reached:
+  fresh = {resource: {k: v for k, v in part.items() if k != "fresh"} for resource, part in parts.items() if part["fresh"]}
+  if fresh:
+    write_json(cache, {**{k: v for k, v in cached.items() if k in ("credits", "budget")}, **fresh})
+
+  credits = parts.get("credits") or {}
+  result["tierLabel"] = credits.get("tierLabel") or ""
+  if credits.get("balance"):
+    result["balance"] = credits["balance"]
+  result["limits"] = (parts.get("budget") or {}).get("limits") or []
+  if parts:
+    result["limitsStale"] = not all(part["fresh"] for part in parts.values())
+    result["limitsFetchedAt"] = min(part["fetchedAtMs"] for part in parts.values())
+
+  # A rejected key can't be fixed from the panel: Kimchi signs in through
+  # its own CLI, not omarchy-agent-account-add, so this status deliberately
+  # isn't one the panel offers its Sign-in link for.
+  if rejected:
+    result["usageStatusText"] = "Kimchi key rejected"
+  elif credits.get("usageStatusText"):
+    result["usageStatusText"] = credits["usageStatusText"]
+  elif not parts:
+    result["usageStatusText"] = "Kimchi credits unavailable"
+  if parts and not rejected:
     result["authHelpText"] = ""
-    result["limitsFetchedAt"] = round(time.time() * 1000)
-    write_json(cache, {"fetchedAtMs": result["limitsFetchedAt"], "tierLabel": result["tierLabel"], "limits": result["limits"], "balance": result.get("balance")})
-    return result
-
-  # Nothing reached the gateway: the last answer stands, dimmed and dated,
-  # rather than a blank section.
-  cached = read_json(cache) or {}
-  if cached.get("fetchedAtMs"):
-    result.update(tierLabel=cached.get("tierLabel") or "", limits=cached.get("limits") or [], limitsStale=True, limitsFetchedAt=cached["fetchedAtMs"])
-    if cached.get("balance"):
-      result["balance"] = cached["balance"]
-  if not result["usageStatusText"]:
+  if unreachable:
     # Usually the seconds after login before the network is up; the panel
     # tries once more soon instead of waiting out its refresh interval.
-    if not cached.get("fetchedAtMs"):
-      result["usageStatusText"] = "Kimchi credits unavailable"
     result["retryAdvised"] = True
   return result
 

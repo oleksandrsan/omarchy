@@ -41,8 +41,14 @@ credits = {
   "key-coder": {"serverless": True, "tier": "coder", "is_paid_tier": True, "remaining": "24.95", "has_credits": True},
   "key-budget": {"serverless": True, "tier": "TEAMS", "remaining": 30, "has_credits": True},
   "key-empty": {"serverless": True, "tier": "free", "remaining": "0", "has_credits": False},
+  "key-sprint": {"serverless": True, "tier": "teams", "remaining": 12, "has_credits": True},
 }
 budgets = {
+  "key-sprint": {"period": {"startTime": "2026-10-01T00:00:00Z", "endTime": "2026-10-15T00:00:00Z"}, "budgets": [
+    {"scope": "TEAM_POOLED", "scopeId": "t-1", "budgetLimitUsd": "100", "totalSpendUsd": "10", "providerBudgets": [
+      {"provider": "openai", "limitType": "CAPPED", "budgetLimitUsd": "20", "usageUsd": "5"},
+    ]},
+  ]},
   "key-budget": {"period": {"startTime": os.environ["PERIOD_START"], "endTime": os.environ["PERIOD_END"]}, "budgets": [
     {"scope": "USER", "scopeId": "u-1", "budgetLimitUsd": "50", "totalSpendUsd": "20", "providerBudgets": [
       {"provider": "anthropic", "limitType": "PROVIDER_LIMIT_TYPE_CAPPED", "budgetLimitUsd": "10", "usageUsd": "2.5"},
@@ -55,7 +61,8 @@ def urlopen(request, timeout=None):
   with open(os.environ["REQUESTS"], "a") as log:
     log.write(request.full_url + "\n")
   key = request.get_header("Authorization").split(" ", 1)[1]
-  if key == "key-offline" or os.environ.get("GATEWAY_DOWN"):
+  down = os.environ.get("GATEWAY_DOWN", "")
+  if key == "key-offline" or down == "all" or (down and request.full_url.endswith("/v1/" + down)):
     raise urllib.error.URLError("offline")
   if key == "key-revoked":
     raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
@@ -94,11 +101,14 @@ KIMCHI_BASE_URL="https://gateway.example/openai/v1/" collect >/dev/null
 pass "the gateway follows Kimchi's region and KIMCHI_BASE_URL"
 
 record=$(KIMCHI_API_KEY=key-budget collect)
-[[ $(jq -c '{tierLabel, limit: (.limits[0] | {label, title, percent}), gauge: (.balance | .funded == 50 and .spent == 20)}' <<<"$record") == '{"tierLabel":"Teams","limit":{"label":"Budget","title":"Monthly","percent":0.4},"gauge":true}' ]] ||
-  fail "a monthly spend budget becomes a Monthly limit and funds the balance gauge" "$record"
+[[ $(jq -c '{tierLabel, limit: (.limits[0] | {label, title, percent}), unfunded: (.balance | .funded == 0 and .spent == 0 and .remaining == 30)}' <<<"$record") == '{"tierLabel":"Teams","limit":{"label":"Budget","title":"Monthly","percent":0.4},"unfunded":true}' ]] ||
+  fail "a monthly spend budget becomes a Monthly limit, and its cap never poses as funding" "$record"
 [[ $(jq -c '[.limits[1:][] | {title, percent}]' <<<"$record") == '[{"title":"Anthropic Monthly","percent":0.25}]' ]] ||
   fail "a capped provider is a scoped allowance on the budget's clock, an uncapped one isn't" "$record"
 [[ $(jq -r '.limits[0].resetsAt' <<<"$record") == "$period_end" ]] || fail "the budget resets when its period ends" "$record"
+record=$(KIMCHI_API_KEY=key-sprint collect)
+[[ $(jq -c '[.limits[] | {title, percent}]' <<<"$record") == '[{"title":null,"percent":0.1},{"title":"Openai budget","percent":0.25}]' ]] ||
+  fail "a period with no clock name still shows its capped providers" "$record"
 pass "a monthly spend budget becomes a Monthly limit with its provider caps"
 
 record=$(KIMCHI_API_KEY=key-empty collect)
@@ -107,8 +117,8 @@ record=$(KIMCHI_API_KEY=key-empty collect)
 pass "an empty balance says Kimchi is rate limited"
 
 record=$(KIMCHI_API_KEY=key-revoked collect)
-[[ $(jq -c '{ready, usageStatusText, retry: .retryAdvised}' <<<"$record") == '{"ready":true,"usageStatusText":"Waiting for auth","retry":null}' ]] ||
-  fail "a rejected key asks for a sign-in" "$record"
+[[ $(jq -c '{ready, usageStatusText, retry: .retryAdvised}' <<<"$record") == '{"ready":true,"usageStatusText":"Kimchi key rejected","retry":null}' ]] ||
+  fail "a rejected key says so without the panel's sign-in link, which can't sign in to Kimchi" "$record"
 record=$(KIMCHI_API_KEY=key-offline collect)
 [[ $(jq -c '{usageStatusText, retry: .retryAdvised}' <<<"$record") == '{"usageStatusText":"Kimchi credits unavailable","retry":true}' ]] ||
   fail "an unreachable gateway asks for a sooner retry" "$record"
@@ -119,13 +129,30 @@ pass "a rejected key and an unreachable gateway are told apart"
 record=$(KIMCHI_API_KEY=key-budget collect)
 fetched=$(jq -r '.limitsFetchedAt' <<<"$record")
 (( fetched > 0 )) && [[ $(jq -r '.limitsStale' <<<"$record") == false ]] || fail "a live answer is dated and not stale" "$record"
-record=$(KIMCHI_API_KEY=key-budget GATEWAY_DOWN=1 collect)
+record=$(KIMCHI_API_KEY=key-budget GATEWAY_DOWN=all collect)
 [[ $(jq -c '{tierLabel, stale: .limitsStale, at: .limitsFetchedAt, limits: (.limits | length), kept: (.balance.remaining == 30), usageStatusText, retry: .retryAdvised}' <<<"$record") == '{"tierLabel":"Teams","stale":true,"at":'"$fetched"',"limits":2,"kept":true,"usageStatusText":"","retry":true}' ]] ||
   fail "an outage keeps the last credits and budgets, marked stale" "$record"
-record=$(KIMCHI_API_KEY=key-coder GATEWAY_DOWN=1 collect)
+record=$(KIMCHI_API_KEY=key-coder GATEWAY_DOWN=all collect)
 [[ $(jq -c '{tierLabel, limits}' <<<"$record") == '{"tierLabel":"Coder","limits":[]}' ]] ||
   fail "another key never shows the last key's numbers" "$record"
 pass "an outage keeps the last credits and budgets, marked stale"
+
+# One endpoint failing keeps that endpoint's last answer and takes the other's
+# fresh one, without letting the half that came back replace the cache.
+record=$(KIMCHI_API_KEY=key-budget collect)
+record=$(KIMCHI_API_KEY=key-budget GATEWAY_DOWN=budget collect)
+[[ $(jq -c '{stale: .limitsStale, limits: (.limits | length), credits: (.balance.remaining == 30), retry: .retryAdvised}' <<<"$record") == '{"stale":true,"limits":2,"credits":true,"retry":true}' ]] ||
+  fail "a failed budget endpoint keeps its last limits beside fresh credits" "$record"
+record=$(KIMCHI_API_KEY=key-budget GATEWAY_DOWN=credits collect)
+[[ $(jq -c '{stale: .limitsStale, tierLabel, limits: (.limits | length), credits: (.balance.remaining == 30)}' <<<"$record") == '{"stale":true,"tierLabel":"Teams","limits":2,"credits":true}' ]] ||
+  fail "a failed credits endpoint keeps its last plan and balance beside fresh limits" "$record"
+pass "one endpoint failing keeps its own last answer"
+
+# The same key asked of another gateway is another answer.
+record=$(KIMCHI_API_KEY=key-budget KIMCHI_BASE_URL="https://gateway.example" GATEWAY_DOWN=all collect)
+[[ $(jq -c '{tierLabel, limits, usageStatusText}' <<<"$record") == '{"tierLabel":"","limits":[],"usageStatusText":"Kimchi credits unavailable"}' ]] ||
+  fail "another gateway never shows the last gateway's numbers" "$record"
+pass "another gateway never shows the last gateway's numbers"
 
 # Tokens come from assistant messages in the pi session files: cached input
 # kept apart, a repeated entry counted once, user turns and other entries
