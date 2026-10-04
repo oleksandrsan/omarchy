@@ -308,15 +308,25 @@ def budget_part(data):
 
 # Keyed by the API key and the gateway it was asked of, so a machine signed
 # in to someone else, or pointed at another region, never shows the last
-# one's numbers.
-def billing_cache(key, base):
+# one's numbers. One file per endpoint, so a run only ever writes the answer
+# it actually got.
+def billing_cache(key, base, resource):
   digest = hashlib.sha256((base + "\n" + key).encode()).hexdigest()[:16]
-  return cache_root() / f"kimchi-billing-{digest}.json"
+  return cache_root() / f"kimchi-{resource}-{digest}.json"
+
+
+# Refreshes can overlap (the panel's own and a limits retry), so an answer
+# only replaces one fetched after it.
+def remember(path, part):
+  current = read_json(path) or {}
+  if float(current.get("fetchedAtMs") or 0) <= part["fetchedAtMs"]:
+    write_json(path, part)
 
 
 # The two endpoints answer on their own, and so does each fall back: a part
 # that didn't come back is the last one that did, dimmed and dated, so one
-# endpoint failing never blanks or overwrites what the other said.
+# endpoint failing never blanks or overwrites what the other said. Any part
+# that didn't come back fresh marks the record stale, cached or not.
 def collect_billing():
   result = {"tierLabel": "", "limits": [], "usageStatusText": "", "authHelpText": AUTH_HELP, "signedIn": False, "limitsStale": False, "limitsFetchedAt": 0}
   key, base = gateway()
@@ -324,33 +334,32 @@ def collect_billing():
     return result
   result["signedIn"] = True
 
-  cache = billing_cache(key, base)
-  cached = read_json(cache) or {}
   parts = {}
-  rejected = unreachable = False
-  now = round(time.time() * 1000)
+  failed = set()
+  rejected = False
   for resource, parse in (("credits", credits_part), ("budget", budget_part)):
+    cache = billing_cache(key, base, resource)
     try:
       data = get_json(f"{base}/v1/{resource}", key)
-      parts[resource] = dict(parse(data if isinstance(data, dict) else {}), fetchedAtMs=now, fresh=True)
+      parts[resource] = dict(parse(data if isinstance(data, dict) else {}), fetchedAtMs=round(time.time() * 1000))
+      remember(cache, parts[resource])
+      continue
     except urllib.error.HTTPError as error:
       rejected = rejected or error.code in (401, 403)
     except Exception:
-      unreachable = True
-    if resource not in parts and isinstance(cached.get(resource), dict) and cached[resource].get("fetchedAtMs"):
-      parts[resource] = dict(cached[resource], fresh=False)
-
-  fresh = {resource: {k: v for k, v in part.items() if k != "fresh"} for resource, part in parts.items() if part["fresh"]}
-  if fresh:
-    write_json(cache, {**{k: v for k, v in cached.items() if k in ("credits", "budget")}, **fresh})
+      pass
+    failed.add(resource)
+    cached = read_json(cache)
+    if isinstance(cached, dict) and cached.get("fetchedAtMs"):
+      parts[resource] = cached
 
   credits = parts.get("credits") or {}
   result["tierLabel"] = credits.get("tierLabel") or ""
   if credits.get("balance"):
     result["balance"] = credits["balance"]
   result["limits"] = (parts.get("budget") or {}).get("limits") or []
+  result["limitsStale"] = bool(failed)
   if parts:
-    result["limitsStale"] = not all(part["fresh"] for part in parts.values())
     result["limitsFetchedAt"] = min(part["fetchedAtMs"] for part in parts.values())
 
   # A rejected key can't be fixed from the panel: Kimchi signs in through
@@ -360,13 +369,14 @@ def collect_billing():
     result["usageStatusText"] = "Kimchi key rejected"
   elif credits.get("usageStatusText"):
     result["usageStatusText"] = credits["usageStatusText"]
-  elif not parts:
+  elif "credits" not in parts:
     result["usageStatusText"] = "Kimchi credits unavailable"
   if parts and not rejected:
     result["authHelpText"] = ""
-  if unreachable:
-    # Usually the seconds after login before the network is up; the panel
-    # tries once more soon instead of waiting out its refresh interval.
+  if failed and not rejected:
+    # Usually the seconds after login before the network is up, or a
+    # gateway hiccup; the panel tries once more soon instead of waiting out
+    # its refresh interval.
     result["retryAdvised"] = True
   return result
 

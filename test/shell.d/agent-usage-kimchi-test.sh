@@ -64,6 +64,8 @@ def urlopen(request, timeout=None):
   down = os.environ.get("GATEWAY_DOWN", "")
   if key == "key-offline" or down == "all" or (down and request.full_url.endswith("/v1/" + down)):
     raise urllib.error.URLError("offline")
+  if os.environ.get("GATEWAY_ERROR") and request.full_url.endswith("/v1/" + os.environ["GATEWAY_ERROR"]):
+    raise urllib.error.HTTPError(request.full_url, 500, "Internal Server Error", {}, None)
   if key == "key-revoked":
     raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
   answers = credits if request.full_url.endswith("/v1/credits") else budgets
@@ -147,6 +149,31 @@ record=$(KIMCHI_API_KEY=key-budget GATEWAY_DOWN=credits collect)
 [[ $(jq -c '{stale: .limitsStale, tierLabel, limits: (.limits | length), credits: (.balance.remaining == 30)}' <<<"$record") == '{"stale":true,"tierLabel":"Teams","limits":2,"credits":true}' ]] ||
   fail "a failed credits endpoint keeps its last plan and balance beside fresh limits" "$record"
 pass "one endpoint failing keeps its own last answer"
+
+# A part that fails before anything was cached is missing, not current: the
+# record is stale and asks for a sooner retry, a server error included.
+rm -f "$XDG_CACHE_HOME"/omarchy/agent-usage/kimchi-budget-*.json
+record=$(KIMCHI_API_KEY=key-sprint GATEWAY_ERROR=budget collect)
+[[ $(jq -c '{stale: .limitsStale, limits, credits: (.balance.remaining == 12), retry: .retryAdvised, usageStatusText}' <<<"$record") == '{"stale":true,"limits":[],"credits":true,"retry":true,"usageStatusText":""}' ]] ||
+  fail "a budget endpoint failing with nothing cached leaves the record stale and retrying" "$record"
+rm -f "$XDG_CACHE_HOME"/omarchy/agent-usage/kimchi-credits-*.json
+record=$(KIMCHI_API_KEY=key-sprint GATEWAY_ERROR=credits collect)
+[[ $(jq -c '{stale: .limitsStale, balance, usageStatusText, retry: .retryAdvised}' <<<"$record") == '{"stale":true,"balance":null,"usageStatusText":"Kimchi credits unavailable","retry":true}' ]] ||
+  fail "a credits endpoint failing with nothing cached says credits are unavailable" "$record"
+pass "a part that fails before anything was cached is missing, not current"
+
+# Refreshes can overlap; an answer fetched earlier never replaces one fetched
+# later, so a slow run finishing last can't roll the cache back.
+KIMCHI_API_KEY=key-budget collect >/dev/null
+credits_cache=$(ls -t "$XDG_CACHE_HOME"/omarchy/agent-usage/kimchi-credits-*.json | head -1)
+later=$(python3 -c 'import time; print(int(time.time() * 1000) + 60000)')
+jq --argjson at "$later" '.fetchedAtMs = $at | .tierLabel = "Enterprise"' "$credits_cache" >"$test_tmp/credits.json"
+mv "$test_tmp/credits.json" "$credits_cache"
+KIMCHI_API_KEY=key-budget collect >/dev/null
+[[ $(jq -r '.tierLabel' "$credits_cache") == "Enterprise" ]] || fail "an earlier answer never replaces a later one" "$(cat "$credits_cache")"
+record=$(KIMCHI_API_KEY=key-budget GATEWAY_DOWN=all collect)
+[[ $(jq -r '.tierLabel' <<<"$record") == "Enterprise" ]] || fail "an outage falls back to the latest answer" "$record"
+pass "overlapping refreshes keep the latest answer"
 
 # The same key asked of another gateway is another answer.
 record=$(KIMCHI_API_KEY=key-budget KIMCHI_BASE_URL="https://gateway.example" GATEWAY_DOWN=all collect)
